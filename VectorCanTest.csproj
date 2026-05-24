@@ -82,6 +82,7 @@
     <Compile Include="Logic\Vector\VectorBus.cs" />
     <Compile Include="Logic\Vector\PeriodicSendTask.cs" />
     <Compile Include="Logic\Vector\VectorConnectionService.cs" />
+    <Compile Include="Logic\Vector\VectorHardwareConfig.cs" />
     <Compile Include="Logic\Vector\IsoTpClient.cs" />
     <Compile Include="Logic\Vector\UdsClient.cs" />
     <Compile Include="Logic\Vector\DtcDecoder.cs" />
