@@ -206,6 +206,12 @@ namespace VectorCanTest.Forms
                 uint reqId  = ParseId(txtRequestId.Text);
                 uint respId = ParseId(txtResponseId.Text);
 
+                if (DateTime.UtcNow.Ticks >= 0)
+                {
+                    ReadDtcWithPhaseTrace(reqId, respId);
+                    return;
+                }
+
                 var isoTp  = new IsoTpClient(_bus);
                 var uds    = new UdsClient(isoTp);
                 byte[] raw = uds.ReadDtcByStatusMask(reqId, respId, 0x09);
@@ -221,6 +227,176 @@ namespace VectorCanTest.Forms
                         Log($"     {r.Code}  Status=0x{r.Status:X2}  [{StatusBits(r.Status)}]");
                 }
             });
+        }
+
+        private void ReadDtcWithPhaseTrace(uint reqId, uint respId)
+        {
+            Log($"  [Phase 1] IDs: req=0x{reqId:X3}, resp=0x{respId:X3}");
+            Log("  [Phase 2] Flush RX queue before diagnostic request");
+            _bus.FlushReceiveQueue();
+            Log("  [Phase 3] TX ReadDTC request: 03-19-02-09-00-00-00-00");
+            _bus.Send(new CanMessage(reqId, new byte[] { 0x03, 0x19, 0x02, 0x09, 0, 0, 0, 0 }), 1000);
+            Log("    TX OK");
+
+            var payload = new List<byte>();
+            int expectedLen = -1;
+            int nextSeq = 1;
+            DateTime deadline = DateTime.UtcNow.AddMilliseconds(6000);
+            bool sawAnyFrame = false;
+            bool sawExpectedId = false;
+            int ignoredFrames = 0;
+            int emptyWindows = 0;
+
+            Log("  [Phase 4] Waiting only for matching response ID up to 6 s...");
+
+            while (DateTime.UtcNow < deadline)
+            {
+                int remaining = Math.Max(1, (int)(deadline - DateTime.UtcNow).TotalMilliseconds);
+                CanMessage rx = _bus.Recv(Math.Min(remaining, 1000));
+
+                if (rx == null)
+                {
+                    emptyWindows++;
+                    continue;
+                }
+
+                sawAnyFrame = true;
+
+                if (rx.ArbitrationId != respId)
+                {
+                    ignoredFrames++;
+                    continue;
+                }
+
+                sawExpectedId = true;
+                Log($"    RX MATCH: ID=0x{rx.ArbitrationId:X3} Data={BitConverter.ToString(rx.Data)}");
+                if (rx.Data.Length == 0)
+                {
+                      Log("      error: empty CAN payload");
+                    return;
+                }
+
+                byte pci = rx.Data[0];
+                byte frameType = (byte)(pci & 0xF0);
+                Log($"  [Phase 5] ISO-TP PCI=0x{pci:X2}, frameType=0x{frameType:X2}");
+
+                if (rx.Data.Length >= 4 && rx.Data[1] == DtcCanConstants.NegativeResponse)
+                {
+                    byte nrc = rx.Data[3];
+                    Log($"  [Phase 6] Negative Response NRC=0x{nrc:X2}");
+
+                    if (nrc == DtcCanConstants.NrcResponsePending)
+                    {
+                        Log("    NRC 0x78 ResponsePending: keep waiting for final response");
+                        continue;
+                    }
+
+                    return;
+                }
+
+                if (frameType == 0x00)
+                {
+                    int len = pci & 0x0F;
+                    Log($"  [Phase 6] Single Frame len={len}");
+
+                    if (len <= 0 || len > 7 || rx.Data.Length < len + 1)
+                    {
+                        Log("    error: invalid Single Frame length");
+                        return;
+                    }
+
+                    byte[] udsPayload = new byte[len];
+                    Array.Copy(rx.Data, 1, udsPayload, 0, len);
+                    DecodeAndLogDtcPayload(udsPayload);
+                    return;
+                }
+
+                if (frameType == 0x10)
+                {
+                    if (rx.Data.Length < 8)
+                    {
+                        Log("    error: First Frame shorter than 8 bytes");
+                        return;
+                    }
+
+                    expectedLen = ((pci & 0x0F) << 8) | rx.Data[1];
+                    payload.Clear();
+                    for (int i = 2; i < rx.Data.Length; i++)
+                        payload.Add(rx.Data[i]);
+
+                    Log($"  [Phase 6] First Frame total UDS len={expectedLen}, buffered={payload.Count}");
+                    Log("  [Phase 7] TX Flow Control: 30-00-00-00-00-00-00-00");
+                    _bus.Send(new CanMessage(reqId, DtcCanConstants.FlowControlContinueToSend), 1000);
+                    Log("    Flow Control TX OK");
+                    continue;
+                }
+
+                if (frameType == 0x20)
+                {
+                    if (expectedLen <= 0)
+                    {
+                        Log("    error: Consecutive Frame received before First Frame");
+                        return;
+                    }
+
+                    int seq = pci & 0x0F;
+                    Log($"  [Phase 8] Consecutive Frame seq={seq}, expected={nextSeq}");
+                    if (seq != nextSeq)
+                    {
+                        Log("    error: ISO-TP sequence mismatch");
+                        return;
+                    }
+
+                    nextSeq = (nextSeq + 1) & 0x0F;
+                    for (int i = 1; i < rx.Data.Length; i++)
+                        payload.Add(rx.Data[i]);
+
+                    Log($"    buffered={payload.Count}/{expectedLen}");
+                    if (payload.Count >= expectedLen)
+                    {
+                        byte[] udsPayload = new byte[expectedLen];
+                        payload.CopyTo(0, udsPayload, 0, expectedLen);
+                        DecodeAndLogDtcPayload(udsPayload);
+                        return;
+                    }
+
+                    continue;
+                }
+
+                Log($"    error: unsupported ISO-TP frame type 0x{frameType:X2}");
+                return;
+            }
+
+            if (!sawAnyFrame)
+                Log($"  [Result] Timeout: no CAN frame received at all. Empty waits={emptyWindows}.");
+            else if (!sawExpectedId)
+                Log($"  [Result] Timeout: no frame matched response ID 0x{respId:X3}. Ignored non-matching frames={ignoredFrames}, empty waits={emptyWindows}.");
+            else
+                Log($"  [Result] Timeout: response started but ISO-TP payload did not complete. Ignored non-matching frames={ignoredFrames}, empty waits={emptyWindows}.");
+        }
+
+        private void DecodeAndLogDtcPayload(byte[] udsPayload)
+        {
+            Log($"  [Phase 8] UDS payload: {BitConverter.ToString(udsPayload)}");
+
+            if (udsPayload.Length < 3 || udsPayload[0] != 0x59 || udsPayload[1] != 0x02)
+            {
+                Log("    error: payload is not positive ReadDTC response 59-02");
+                return;
+            }
+
+            Log($"    availability/status mask=0x{udsPayload[2]:X2}");
+            var records = DtcDecoder.ParseReadDtcResponse(udsPayload);
+
+            if (records.Count == 0)
+            {
+                Log("  [Result] No DTCs stored.");
+                return;
+            }
+
+            Log($"  [Result] {records.Count} DTC(s):");
+            foreach (var r in records)
+                Log($"     {r.Code}  Status=0x{r.Status:X2}  [{StatusBits(r.Status)}]");
         }
 
         private void BtnReadVin_Click(object sender, EventArgs e)

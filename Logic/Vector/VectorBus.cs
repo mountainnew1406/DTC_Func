@@ -156,6 +156,12 @@ namespace VectorCanTest.Logic.Vector
         // ICanBus — Periodic
         // ─────────────────────────────────────────────────────────────────────
 
+        public void FlushReceiveQueue()
+        {
+            ThrowIfDisposed();
+            _driver.XL_FlushReceiveQueue(_portHandle);
+        }
+
         public PeriodicSendTask SendPeriodic(
             IReadOnlyList<CanMessage> messages,
             TimeSpan period,
